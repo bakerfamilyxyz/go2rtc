@@ -1,0 +1,193 @@
+# Rebases a configurable Reolink source branch onto the latest upstream go2rtc
+# release tag, builds a static linux/amd64 binary, and publishes GitHub Releases.
+#
+# Switch source branch (workflow_dispatch input or edit default SRC below):
+#   ucbmckee/topic/reolink-baichuan  (PR AlexxIT/go2rtc#2413, default)
+#   fzurita/reolink_protocol           (PR AlexxIT/go2rtc#2263, fallback)
+#
+# Fork-only: does not open PRs against AlexxIT/go2rtc or upstream PR authors.
+
+name: reolink-refresh
+
+on:
+  schedule:
+    - cron: "0 12 * * 1" # Mondays 12:00 UTC
+  workflow_dispatch:
+    inputs:
+      src:
+        description: "Remote/branch (e.g. ucbmckee/topic/reolink-baichuan)"
+        required: false
+        default: ucbmckee/topic/reolink-baichuan
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  SRC: ${{ github.event.inputs.src || 'ucbmckee/topic/reolink-baichuan' }}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git and remotes
+        run: |
+          git config user.name "reolink-refresh[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/AlexxIT/go2rtc.git
+          git remote add ucbmckee https://github.com/ucbmckee/go2rtc-ucbmckee.git
+          git remote add fzurita https://github.com/fzurita/go2rtc.git
+          git fetch --all --tags --prune
+
+      - name: Resolve upstream tag and source commit
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+          SRC_REF="${{ env.SRC }}"
+          SRC_FULL="$(git rev-parse "$SRC_REF")"
+          SRC_SHORT="$(git rev-parse --short "$SRC_FULL")"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          REL_TAG="${TAG}-reolink.$(date -u +%Y%m%d)"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "SRC_REF=$SRC_REF" >> "$GITHUB_ENV"
+          echo "SRC_FULL=$SRC_FULL" >> "$GITHUB_ENV"
+          echo "SRC_SHORT=$SRC_SHORT" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$BUILD_DATE" >> "$GITHUB_ENV"
+          echo "REL_TAG=$REL_TAG" >> "$GITHUB_ENV"
+
+      - name: Skip if unchanged since last release
+        id: skip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BODY="$(gh release list --repo "${{ github.repository }}" --limit 20 --json tagName,body \
+            -q '.[] | select(.tagName | test("-reolink\\.")) | .body' | head -1 || true)"
+          if [ -z "$BODY" ]; then
+            echo "No prior reolink release; will build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LAST_UPSTREAM="$(echo "$BODY" | sed -n 's/^upstream_tag: *//p' | head -1)"
+          LAST_SRC="$(echo "$BODY" | sed -n 's/^src_commit: *//p' | head -1)"
+          if [ "$LAST_UPSTREAM" = "$TAG" ] && [ "$LAST_SRC" = "$SRC_FULL" ]; then
+            echo "Upstream tag and source commit unchanged ($TAG @ $SRC_SHORT); skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Change detected (was upstream=$LAST_UPSTREAM src=$LAST_SRC)."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase onto upstream release tag
+        id: rebase
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git checkout -B reolink "$SRC_REF"
+          if ! git rebase "$TAG"; then
+            echo "conflict_files<<EOF" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            git rebase --abort
+            exit 1
+          fi
+          FORK_COMMIT="$(git rev-parse HEAD)"
+          FORK_SHORT="$(git rev-parse --short HEAD)"
+          echo "FORK_COMMIT=$FORK_COMMIT" >> "$GITHUB_ENV"
+          echo "FORK_SHORT=$FORK_SHORT" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@v5
+        if: steps.skip.outputs.skip != 'true' && success()
+        with:
+          go-version: "1.27"
+
+      - name: Build and test
+        id: build
+        if: steps.skip.outputs.skip != 'true' && success()
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          go build -ldflags "-s -w" -trimpath -o go2rtc_linux_amd64 .
+          ./go2rtc_linux_amd64 -version
+          file go2rtc_linux_amd64 | grep -q 'statically linked'
+          go test ./pkg/reolink/... ./pkg/baichuan/... ./pkg/webrtc/... ./pkg/h264/... ./pkg/h265/...
+          sha256sum go2rtc_linux_amd64 | tee go2rtc_linux_amd64.sha256
+          VERSION="$(./go2rtc_linux_amd64 -version 2>&1 | awk '{print $3}')"
+          SHA256="$(cut -d' ' -f1 go2rtc_linux_amd64.sha256)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+
+      - name: Publish reolink branch and release
+        if: steps.skip.outputs.skip != 'true' && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE="$(mktemp)"
+          cat > "$NOTES_FILE" <<EOF
+          upstream_tag: $TAG
+          src_ref: $SRC_REF
+          src_commit: $SRC_FULL
+          fork_commit: $FORK_COMMIT
+          build_date: $BUILD_DATE
+          version: $VERSION
+          sha256: $SHA256
+
+          Static linux/amd64 build (CGO_ENABLED=0) from ucbmckee #2413 or fzurita #2263 source, rebased on upstream $TAG.
+          EOF
+          git push --force-with-lease origin reolink
+          if gh release view "$REL_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$REL_TAG" go2rtc_linux_amd64 go2rtc_linux_amd64.sha256 --clobber \
+              --repo "${{ github.repository }}"
+            gh release edit "$REL_TAG" --notes-file "$NOTES_FILE" --repo "${{ github.repository }}"
+          else
+            gh release create "$REL_TAG" go2rtc_linux_amd64 go2rtc_linux_amd64.sha256 \
+              --title "$REL_TAG" --notes-file "$NOTES_FILE" --repo "${{ github.repository }}"
+          fi
+
+      - name: Report failure (issue)
+        if: failure() && steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TITLE="reolink-refresh failed"
+          STEP="${{ steps.rebase.conclusion == 'failure' && 'rebase' || (steps.build.conclusion == 'failure' && 'build/test' || 'unknown') }}"
+          CONFLICTS="${{ steps.rebase.outputs.conflict_files }}"
+          BODY="$(cat <<EOF
+          Automated **reolink-refresh** workflow failed (${STEP}).
+
+          - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          - Upstream tag: \`${TAG:-unknown}\`
+          - Source: \`${SRC_REF:-${{ env.SRC }}}\` @ \`${SRC_SHORT:-unknown}\` (\`${SRC_FULL:-unknown}\`)
+          - Scheduled/workflow_dispatch at: ${{ github.event_name }}
+
+          EOF
+          )"
+          if [ -n "$CONFLICTS" ]; then
+            BODY="${BODY}
+
+          **Rebase conflicts:**
+          \`\`\`
+          ${CONFLICTS}
+          \`\`\`
+          "
+          fi
+          BODY="${BODY}
+
+          No changes were pushed to \`reolink\` and no release was published.
+          "
+          ISSUE_NUM="$(gh issue list --repo "${{ github.repository }}" --search "in:title ${TITLE}" --json number -q '.[0].number' || true)"
+          if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+            gh issue comment "$ISSUE_NUM" --repo "${{ github.repository }}" --body "$BODY"
+          else
+            gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body "$BODY"
+          fi

@@ -22,6 +22,8 @@
 
 Ultimate camera streaming application with support for dozens formats and protocols.
 
+> **bakerfamilyxyz fork:** Native Reolink/Baichuan builds are on branch [`reolink`](https://github.com/bakerfamilyxyz/go2rtc/tree/reolink) with [release binaries](https://github.com/bakerfamilyxyz/go2rtc/releases) maintained by [`.github/workflows/reolink-refresh.yml`](.github/workflows/reolink-refresh.yml). To use fzurita’s branch instead of ucbmckee’s, run the workflow manually and set `src` to `fzurita/reolink_protocol`.
+
 - zero-dependency [small app](#go2rtc-binary) for all OS (Windows, macOS, Linux, FreeBSD)
 - zero-delay for many [supported protocols](#codecs-madness) (lowest possible streaming latency)
 - [streaming input](#streaming-input) from dozens formats and protocols
