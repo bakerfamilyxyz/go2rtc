@@ -12,10 +12,6 @@ name: reolink-refresh
 on:
   schedule:
     - cron: "0 12 * * 1" # Mondays 12:00 UTC
-  push:
-    branches: [master]
-    paths:
-      - .github/workflows/reolink-refresh.yml
   workflow_dispatch:
     inputs:
       src:
